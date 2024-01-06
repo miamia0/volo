@@ -1,5 +1,7 @@
 use std::{
     cell::RefCell,
+    collections::VecDeque,
+    marker::PhantomData,
     sync::{
         atomic::{AtomicBool, AtomicUsize},
         Arc,
@@ -33,8 +35,8 @@ lazy_static::lazy_static! {
 }
 
 #[pin_project]
-pub struct ThriftTransport<E, Resp> {
-    write_half: Arc<Mutex<WriteHalf<E>>>,
+pub struct ThriftTransport<E, Req, Resp> {
+    _phantom1: PhantomData<fn() -> E>,
     dirty: Arc<AtomicBool>,
     #[allow(clippy::type_complexity)]
     tx_map: Arc<
@@ -47,25 +49,67 @@ pub struct ThriftTransport<E, Resp> {
     read_error: Arc<AtomicBool>,
     // read connection is closed
     read_closed: Arc<AtomicBool>,
+
+    batch_queue: Arc<Mutex<VecDeque<ThriftMessage<Req>>>>,
 }
 
-impl<E, Resp> Clone for ThriftTransport<E, Resp> {
+impl<E, Req, Resp> Clone for ThriftTransport<E, Req, Resp> {
     fn clone(&self) -> Self {
         Self {
-            write_half: self.write_half.clone(),
             dirty: self.dirty.clone(),
             tx_map: self.tx_map.clone(),
             write_error: self.write_error.clone(),
             read_error: self.read_error.clone(),
             read_closed: self.read_closed.clone(),
+            batch_queue: self.batch_queue.clone(),
+            _phantom1: PhantomData,
         }
     }
 }
 
-impl<E, Resp> ThriftTransport<E, Resp>
+impl<E, Req, Resp> ThriftTransport<E, Req, Resp>
 where
     E: Encoder,
+    Req: EntryMessage + Send + 'static + Sync,
+    Resp: EntryMessage + Send + 'static + Sync,
 {
+    pub fn write_loop(&self, mut write_half: WriteHalf<E>) -> Result<(), Error> {
+        let batch_queu = self.batch_queue.clone();
+        let inner_tx_map = self.tx_map.clone();
+        tokio::spawn(async move {
+            loop {
+                {
+                    let mut queue = batch_queu.lock().await;
+
+                    // push data to
+                    while !queue.is_empty() {
+                        let current = queue.pop_front().unwrap();
+
+                        let mut cx = ClientContext::new(
+                            -1,
+                            RpcInfo::with_role(Role::Client),
+                            pilota::thrift::TMessageType::Call,
+                        );
+                        let seq = current.meta.seq_id;
+                        let res = write_half.send(&mut cx, current).await;
+                        match res {
+                            Ok(_) => {}
+                            Err(_) => {
+                                inner_tx_map.remove(&seq).await.unwrap().send(Err(
+                                    Error::Application(ApplicationError::new(
+                                        ApplicationErrorKind::UNKNOWN,
+                                        format!("err"),
+                                    )),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
     pub fn new<
         R: AsyncRead + Send + Sync + Unpin + 'static,
         W: AsyncWrite + Send + Sync + Unpin + 'static,
@@ -102,6 +146,7 @@ where
         let inner_read_error = read_error.clone();
         let read_closed = Arc::new(AtomicBool::new(false));
         let inner_read_closed = read_closed.clone();
+        //// read loop
         tokio::spawn(async move {
             metainfo::METAINFO
                 .scope(RefCell::new(Default::default()), async move {
@@ -173,23 +218,27 @@ where
                 })
                 .await;
         });
-        Self {
-            write_half: Arc::new(Mutex::new(write_half)),
+        let ret = Self {
             dirty: Arc::new(AtomicBool::new(false)),
             tx_map,
             write_error,
             read_error,
             read_closed,
-        }
+            batch_queue: Default::default(),
+            _phantom1: PhantomData,
+        };
+        ret.write_loop(write_half);
+        ret
     }
 }
 
-impl<E, Resp> ThriftTransport<E, Resp>
+impl<E, Req, Resp> ThriftTransport<E, Req, Resp>
 where
     E: Encoder,
     Resp: EntryMessage,
+    Req: EntryMessage,
 {
-    pub async fn send<Req: EntryMessage>(
+    pub async fn send(
         &self,
         cx: &mut ClientContext,
         msg: ThriftMessage<Req>,
@@ -213,7 +262,6 @@ where
         if !oneway {
             self.tx_map.insert(seq_id, tx).await;
         }
-        let mut wh = self.write_half.lock().await;
         // check connection dirty
         if self.dirty.load(std::sync::atomic::Ordering::Relaxed) {
             // connection is dirty, we should also set write error to indicate the connection should
@@ -226,18 +274,12 @@ where
             )));
         }
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-        let res = wh.send(cx, msg).await;
+        {
+            self.batch_queue.lock().await.push_back(msg);
+        }
         self.dirty
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        drop(wh);
-        if let Err(e) = res {
-            self.write_error
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            if !oneway {
-                self.tx_map.remove(&seq_id).await;
-            }
-            return Err(e);
-        }
+
         if oneway {
             return Ok(None);
         }
@@ -348,7 +390,7 @@ where
     }
 }
 
-impl<TTEncoder, Resp> Poolable for ThriftTransport<TTEncoder, Resp> {
+impl<TTEncoder, Req, Resp> Poolable for ThriftTransport<TTEncoder, Req, Resp> {
     fn reusable(&self) -> bool {
         !self.write_error.load(std::sync::atomic::Ordering::Relaxed)
             && !self.read_error.load(std::sync::atomic::Ordering::Relaxed)
