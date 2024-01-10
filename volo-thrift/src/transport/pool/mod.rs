@@ -237,10 +237,10 @@ impl<K: Key, T: Poolable + Send + 'static> Pool<K, T> {
                     key: key.clone(),
                     pool: WeakOpt::downgrade(&self.inner),
                 };
-                tracing::trace!("Multiplex connecting for {:?}", key);
+                tracing::debug!("Multiplex connecting for {:?}", key);
                 Some(connecting)
             } else {
-                tracing::trace!("Multiplex connecting already in progress for {:?}", key);
+                tracing::debug!("Multiplex connecting already in progress for {:?}", key);
                 None
             };
         }
@@ -270,7 +270,7 @@ impl<K: Key, T: Poolable + Send + 'static> Pool<K, T> {
             // 1. check the idle and opened connections
             let expiration = Expiration::new(Some(inner.timeout));
             let entry = inner.idle.get_mut(&key).and_then(|list| {
-                tracing::trace!("[VOLO] take? {:?}: expiration = {:?}", key, expiration.0);
+                tracing::debug!("[VOLO] take? {:?}: expiration = {:?}", key, expiration.0);
                 {
                     let popper = IdlePopper { key: &key, list };
                     popper.pop(&expiration)
