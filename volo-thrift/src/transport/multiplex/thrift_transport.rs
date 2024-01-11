@@ -1,7 +1,5 @@
 use std::{
     cell::RefCell,
-    collections::VecDeque,
-    marker::PhantomData,
     sync::{
         atomic::{AtomicBool, AtomicUsize},
         Arc,
@@ -14,7 +12,6 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{oneshot, Mutex},
 };
-use tokio_condvar::Condvar;
 use volo::{
     context::{Role, RpcInfo},
     net::Address,
@@ -23,10 +20,7 @@ use volo::{
 use crate::{
     codec::{Decoder, Encoder, MakeCodec},
     context::{ClientContext, ThriftContext},
-    transport::{
-        multiplex::utils::TxHashMap,
-        pool::{Poolable, Reservation},
-    },
+    transport::pool::{Poolable, Reservation},
     ApplicationError, ApplicationErrorKind, EntryMessage, Error, ThriftMessage,
 };
 
@@ -36,13 +30,18 @@ lazy_static::lazy_static! {
 }
 
 #[pin_project]
-pub struct ThriftTransport<E, Req, Resp> {
-    _phantom1: PhantomData<fn() -> E>,
-
+pub struct ThriftTransport<E, Resp> {
+    write_half: Arc<Mutex<WriteHalf<E>>>,
+    dirty: Arc<AtomicBool>,
     #[allow(clippy::type_complexity)]
     tx_map: Arc<
-        TxHashMap<
-            oneshot::Sender<crate::Result<Option<(MetaInfo, ClientContext, ThriftMessage<Resp>)>>>,
+        Mutex<
+            fxhash::FxHashMap<
+                i32,
+                oneshot::Sender<
+                    crate::Result<Option<(MetaInfo, ClientContext, ThriftMessage<Resp>)>>,
+                >,
+            >,
         >,
     >,
     write_error: Arc<AtomicBool>,
@@ -50,120 +49,25 @@ pub struct ThriftTransport<E, Req, Resp> {
     read_error: Arc<AtomicBool>,
     // read connection is closed
     read_closed: Arc<AtomicBool>,
-    // TODO make this to lockless
-    batch_queue: Arc<Mutex<VecDeque<ThriftMessage<Req>>>>,
-    queue_cv: Arc<Condvar>,
 }
 
-impl<E, Req, Resp> Clone for ThriftTransport<E, Req, Resp> {
+impl<E, Resp> Clone for ThriftTransport<E, Resp> {
     fn clone(&self) -> Self {
         Self {
+            write_half: self.write_half.clone(),
+            dirty: self.dirty.clone(),
             tx_map: self.tx_map.clone(),
             write_error: self.write_error.clone(),
             read_error: self.read_error.clone(),
             read_closed: self.read_closed.clone(),
-            batch_queue: self.batch_queue.clone(),
-            _phantom1: PhantomData,
-            queue_cv: self.queue_cv.clone(),
         }
     }
 }
 
-impl<E, Req, Resp> ThriftTransport<E, Req, Resp>
+impl<E, Resp> ThriftTransport<E, Resp>
 where
     E: Encoder,
-    Req: EntryMessage + Send + 'static + Sync,
-    Resp: EntryMessage + Send + 'static + Sync,
 {
-    pub fn write_loop(&self, mut write_half: WriteHalf<E>) {
-        let batch_queu = self.batch_queue.clone();
-        let inner_tx_map = self.tx_map.clone();
-        let inner_read_error: Arc<AtomicBool> = self.read_error.clone();
-        let inner_read_closed = self.read_closed.clone();
-        let inner_write_error = self.write_error.clone();
-        let queue_cv = self.queue_cv.clone();
-        tokio::spawn(async move {
-            let mut resolved = Vec::with_capacity(32);
-            let mut has_error;
-            loop {
-                {
-                    resolved.clear();
-                    write_half.reset().await;
-                    has_error = false;
-                    let mut queue = batch_queu.lock().await;
-                    while queue.is_empty()
-                        && !inner_read_error.load(std::sync::atomic::Ordering::Relaxed)
-                        && !inner_read_closed.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        queue = queue_cv.wait(queue).await;
-                    }
-
-                    if inner_read_error.load(std::sync::atomic::Ordering::Relaxed)
-                        || inner_read_closed.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        return;
-                    }
-
-                    while !queue.is_empty() {
-                        let current = queue.pop_front().unwrap();
-                        let seq = current.meta.seq_id;
-                        resolved.push(seq);
-                        let mut cx = ClientContext::new(
-                            seq,
-                            RpcInfo::with_role(Role::Client),
-                            pilota::thrift::TMessageType::Call,
-                        );
-                        let res = write_half.encode(&mut cx, current).await;
-                        match res {
-                            Ok(_) => {}
-                            Err(err) => {
-                                tracing::error!(
-                                    "[VOLO] multiplex connection encode error: {}",
-                                    err
-                                );
-                                inner_write_error.store(true, std::sync::atomic::Ordering::Relaxed);
-                                has_error = true;
-                                while !queue.is_empty() {
-                                    let current = queue.pop_front().unwrap();
-                                    resolved.push(current.meta.seq_id);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    if has_error {
-                        for seq in resolved.iter() {
-                            let _ = inner_tx_map.remove(seq).await.unwrap().send(Err(
-                                Error::Application(ApplicationError::new(
-                                    ApplicationErrorKind::UNKNOWN,
-                                    format!("write error "),
-                                )),
-                            ));
-                        }
-                        return;
-                    }
-                    let res = write_half.flush().await;
-                    match res {
-                        Ok(_) => {}
-                        Err(err) => {
-                            tracing::error!("[VOLO] multiplex connection flush error: {}", err,);
-                            inner_write_error.store(true, std::sync::atomic::Ordering::Relaxed);
-                            for seq in resolved.iter() {
-                                let _ = inner_tx_map.remove(&seq).await.unwrap().send(Err(
-                                    Error::Application(ApplicationError::new(
-                                        ApplicationErrorKind::UNKNOWN,
-                                        err.to_string(),
-                                    )),
-                                ));
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
     pub fn new<
         R: AsyncRead + Send + Sync + Unpin + 'static,
         W: AsyncWrite + Send + Sync + Unpin + 'static,
@@ -187,9 +91,12 @@ where
         let write_half = WriteHalf { encoder, id };
         #[allow(clippy::type_complexity)]
         let tx_map: Arc<
-            TxHashMap<
-                oneshot::Sender<
-                    crate::Result<Option<(MetaInfo, ClientContext, ThriftMessage<Resp>)>>,
+            Mutex<
+                fxhash::FxHashMap<
+                    i32,
+                    oneshot::Sender<
+                        crate::Result<Option<(MetaInfo, ClientContext, ThriftMessage<Resp>)>>,
+                    >,
                 >,
             >,
         > = Default::default();
@@ -200,9 +107,6 @@ where
         let inner_read_error = read_error.clone();
         let read_closed = Arc::new(AtomicBool::new(false));
         let inner_read_closed = read_closed.clone();
-        let queue_cv = Arc::new(Condvar::new());
-        let inner_queue_cv = queue_cv.clone();
-        //// read loop
         tokio::spawn(async move {
             metainfo::METAINFO
                 .scope(RefCell::new(Default::default()), async move {
@@ -227,42 +131,35 @@ where
                                 e,
                                 target
                             );
+                            let mut tx_map = inner_tx_map.lock().await;
                             inner_read_error.store(true, std::sync::atomic::Ordering::Relaxed);
-                            inner_queue_cv.notify_all();
-
-                            inner_tx_map
-                                .for_all_drain(|tx| {
-                                    let _ =
-                                        tx.send(Err(Error::Application(ApplicationError::new(
-                                            ApplicationErrorKind::UNKNOWN,
-                                            format!(
-                                                "multiplex connection error: {e}, target: {target}"
-                                            ),
-                                        ))));
-                                })
-                                .await;
+                            for (_, tx) in tx_map.drain() {
+                                let _ = tx.send(Err(Error::Application(ApplicationError::new(
+                                    ApplicationErrorKind::UNKNOWN,
+                                    format!("multiplex connection error: {e}, target: {target}"),
+                                ))));
+                            }
                             return;
                         }
                         // we have checked the error above, so it's safe to unwrap here
                         let res = res.unwrap();
                         if res.is_none() {
                             // the connection is closed
-                            if !inner_tx_map.is_empty().await {
+                            let mut tx_map = inner_tx_map.lock().await;
+                            if !tx_map.is_empty() {
                                 inner_read_error.store(true, std::sync::atomic::Ordering::Relaxed);
-                                inner_tx_map
-                                    .for_all_drain(|tx| {
-                                        let _ = tx.send(Ok(None));
-                                    })
-                                    .await;
+                                for (_, tx) in tx_map.drain() {
+                                    let _ = tx.send(Ok(None));
+                                }
                             }
                             inner_read_closed.store(true, std::sync::atomic::Ordering::Relaxed);
-                            inner_queue_cv.notify_all();
                             return;
                         }
                         // now we get ThriftMessage<Resp>
                         let res = res.unwrap();
                         let seq_id = res.meta.seq_id;
-                        if let Some(tx) = inner_tx_map.remove(&seq_id).await {
+                        let mut tx_map = inner_tx_map.lock().await;
+                        if let Some(tx) = tx_map.remove(&seq_id) {
                             metainfo::METAINFO.with(|mi| {
                                 let mi = mi.take();
                                 let _ = tx.send(Ok(Some((mi, cx, res))));
@@ -279,27 +176,23 @@ where
                 })
                 .await;
         });
-        let ret = Self {
+        Self {
+            write_half: Arc::new(Mutex::new(write_half)),
+            dirty: Arc::new(AtomicBool::new(false)),
             tx_map,
             write_error,
             read_error,
             read_closed,
-            batch_queue: Default::default(),
-            _phantom1: PhantomData,
-            queue_cv,
-        };
-        ret.write_loop(write_half);
-        ret
+        }
     }
 }
 
-impl<E, Req, Resp> ThriftTransport<E, Req, Resp>
+impl<E, Resp> ThriftTransport<E, Resp>
 where
     E: Encoder,
     Resp: EntryMessage,
-    Req: EntryMessage,
 {
-    pub async fn send(
+    pub async fn send<Req: EntryMessage>(
         &self,
         cx: &mut ClientContext,
         msg: ThriftMessage<Req>,
@@ -318,21 +211,38 @@ where
                 "multiplex connection closed".to_string(),
             )));
         }
-        if self.write_error.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(Error::Application(ApplicationError::new(
-                ApplicationErrorKind::UNKNOWN,
-                "multiplex connection error".to_string(),
-            )));
-        }
-
         let (tx, rx) = oneshot::channel();
+        let mut tx_map = self.tx_map.lock().await;
         let seq_id = msg.meta.seq_id;
         if !oneway {
-            self.tx_map.insert(seq_id, tx).await;
+            tx_map.insert(seq_id, tx);
         }
-        {
-            self.batch_queue.lock().await.push_back(msg);
-            self.queue_cv.notify_all();
+        drop(tx_map);
+        let mut wh = self.write_half.lock().await;
+        // check connection dirty
+        if self.dirty.load(std::sync::atomic::Ordering::Relaxed) {
+            // connection is dirty, we should also set write error to indicate the connection should
+            // not be reused
+            self.write_error
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(Error::Application(ApplicationError::new(
+                ApplicationErrorKind::UNKNOWN,
+                "multiplex connection is dirty".to_string(),
+            )));
+        }
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        let res = wh.send(cx, msg).await;
+        self.dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        drop(wh);
+        if let Err(e) = res {
+            self.write_error
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if !oneway {
+                let mut tx_map = self.tx_map.lock().await;
+                tx_map.remove(&seq_id);
+            }
+            return Err(e);
         }
         if oneway {
             return Ok(None);
@@ -425,7 +335,6 @@ pub struct WriteHalf<E> {
     id: usize,
 }
 
-#[allow(dead_code)]
 impl<E> WriteHalf<E>
 where
     E: Encoder,
@@ -435,34 +344,17 @@ where
         cx: &mut impl ThriftContext,
         msg: ThriftMessage<T>,
     ) -> Result<(), Error> {
-        self.encoder.send(cx, msg).await.map_err(|mut e| {
-            e.append_msg(&format!(", rpcinfo: {:?}", cx.rpc_info()));
-            tracing::error!("[VOLO] transport[{}] encode error: {:?}", self.id, e);
-            e
-        })
-    }
-    pub async fn reset(&mut self) {
-        self.encoder.reset().await;
-    }
-
-    pub async fn encode<T: EntryMessage>(
-        &mut self,
-        cx: &mut impl ThriftContext,
-        msg: ThriftMessage<T>,
-    ) -> Result<(), Error> {
         self.encoder.encode(cx, msg).await.map_err(|mut e| {
             e.append_msg(&format!(", rpcinfo: {:?}", cx.rpc_info()));
             tracing::error!("[VOLO] transport[{}] encode error: {:?}", self.id, e);
             e
-        })
-    }
+        })?;
 
-    pub async fn flush(&mut self) -> Result<(), Error> {
-        self.encoder.flush().await
+        Ok(())
     }
 }
 
-impl<TTEncoder, Req, Resp> Poolable for ThriftTransport<TTEncoder, Req, Resp> {
+impl<TTEncoder, Resp> Poolable for ThriftTransport<TTEncoder, Resp> {
     fn reusable(&self) -> bool {
         !self.write_error.load(std::sync::atomic::Ordering::Relaxed)
             && !self.read_error.load(std::sync::atomic::Ordering::Relaxed)

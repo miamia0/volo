@@ -444,10 +444,9 @@ impl<IL, OL, C, Req, Resp, MkT, MkC, LB> ClientBuilder<IL, OL, C, Req, Resp, MkT
 }
 
 #[derive(Clone)]
-pub struct MessageService<Req, Resp, MkT, MkC>
+pub struct MessageService<Resp, MkT, MkC>
 where
-    Req: EntryMessage + Send + 'static + Sync,
-    Resp: EntryMessage + Send + 'static + Sync,
+    Resp: EntryMessage + Send + 'static,
     MkT: MakeTransport,
     MkC: MakeCodec<MkT::ReadHalf, MkT::WriteHalf> + Sync,
 {
@@ -456,13 +455,13 @@ where
     #[cfg(feature = "multiplex")]
     inner: motore::utils::Either<
         pingpong::Client<Resp, MkT, MkC>,
-        crate::transport::multiplex::Client<Req, Resp, MkT, MkC>,
+        crate::transport::multiplex::Client<Resp, MkT, MkC>,
     >,
 }
 
-impl<Req, Resp, MkT, MkC> Service<ClientContext, Req> for MessageService<Req, Resp, MkT, MkC>
+impl<Req, Resp, MkT, MkC> Service<ClientContext, Req> for MessageService<Resp, MkT, MkC>
 where
-    Req: Send + 'static + EntryMessage + Sync,
+    Req: EntryMessage + 'static + Send,
     Resp: Send + 'static + EntryMessage + Sync,
     MkT: MakeTransport,
     MkC: MakeCodec<MkT::ReadHalf, MkT::WriteHalf> + Sync,
@@ -507,8 +506,8 @@ where
         + Clone
         + Sync,
     Req: EntryMessage + Send + 'static + Sync + Clone,
-    Resp: EntryMessage + Send + 'static + Sync,
-    IL: Layer<MessageService<Req, Resp, MkT, MkC>>,
+    Resp: EntryMessage + Send + 'static,
+    IL: Layer<MessageService<Resp, MkT, MkC>>,
     IL::Service:
         Service<ClientContext, Req, Response = Option<Resp>> + Sync + Clone + Send + 'static,
     <IL::Service as Service<ClientContext, Req>>::Error: Send + Into<Error>,

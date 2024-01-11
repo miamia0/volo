@@ -15,18 +15,18 @@ use crate::{
     EntryMessage, Error, ThriftMessage,
 };
 
-pub struct MakeClientTransport<MkT, MkC, Req, Resp>
+pub struct MakeClientTransport<MkT, MkC, Resp>
 where
     MkT: MakeTransport,
     MkC: MakeCodec<MkT::ReadHalf, MkT::WriteHalf>,
 {
     make_transport: MkT,
     make_codec: MkC,
-    _phantom: PhantomData<(fn() -> Resp, fn() -> Req)>,
+    _phantom: PhantomData<fn() -> Resp>,
 }
 
-impl<MkT: MakeTransport, MkC: MakeCodec<MkT::ReadHalf, MkT::WriteHalf>, Req, Resp> Clone
-    for MakeClientTransport<MkT, MkC, Req, Resp>
+impl<MkT: MakeTransport, MkC: MakeCodec<MkT::ReadHalf, MkT::WriteHalf>, Resp> Clone
+    for MakeClientTransport<MkT, MkC, Resp>
 {
     fn clone(&self) -> Self {
         Self {
@@ -37,7 +37,7 @@ impl<MkT: MakeTransport, MkC: MakeCodec<MkT::ReadHalf, MkT::WriteHalf>, Req, Res
     }
 }
 
-impl<MkT, MkC, Req, Resp> MakeClientTransport<MkT, MkC, Req, Resp>
+impl<MkT, MkC, Resp> MakeClientTransport<MkT, MkC, Resp>
 where
     MkT: MakeTransport,
     MkC: MakeCodec<MkT::ReadHalf, MkT::WriteHalf>,
@@ -52,14 +52,13 @@ where
     }
 }
 
-impl<MkT, MkC, Req, Resp> UnaryService<Address> for MakeClientTransport<MkT, MkC, Req, Resp>
+impl<MkT, MkC, Resp> UnaryService<Address> for MakeClientTransport<MkT, MkC, Resp>
 where
     MkT: MakeTransport,
     MkC: MakeCodec<MkT::ReadHalf, MkT::WriteHalf> + Sync,
-    Resp: EntryMessage + Send + 'static + Sync,
-    Req: EntryMessage + Send + 'static + Sync,
+    Resp: EntryMessage + Send + 'static,
 {
-    type Response = ThriftTransport<MkC::Encoder, Req, Resp>;
+    type Response = ThriftTransport<MkC::Encoder, Resp>;
     type Error = io::Error;
 
     async fn call(&self, target: Address) -> Result<Self::Response, Self::Error> {
@@ -74,24 +73,22 @@ where
     }
 }
 
-pub struct Client<Req, Resp, MkT, MkC>
+pub struct Client<Resp, MkT, MkC>
 where
     MkT: MakeTransport,
     MkC: MakeCodec<MkT::ReadHalf, MkT::WriteHalf> + Sync,
-    Resp: EntryMessage + Send + 'static + Sync,
-    Req: EntryMessage + Send + 'static + Sync,
+    Resp: EntryMessage + Send + 'static,
 {
     #[allow(clippy::type_complexity)]
-    make_transport: PooledMakeTransport<MakeClientTransport<MkT, MkC, Req, Resp>, Address>,
+    make_transport: PooledMakeTransport<MakeClientTransport<MkT, MkC, Resp>, Address>,
     _marker: PhantomData<Resp>,
 }
 
-impl<Req, Resp, MkT, MkC> Clone for Client<Req, Resp, MkT, MkC>
+impl<Resp, MkT, MkC> Clone for Client<Resp, MkT, MkC>
 where
     MkT: MakeTransport,
     MkC: MakeCodec<MkT::ReadHalf, MkT::WriteHalf> + Sync,
-    Resp: EntryMessage + Send + 'static + Sync,
-    Req: EntryMessage + Send + 'static + Sync,
+    Resp: EntryMessage + Send + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -101,12 +98,11 @@ where
     }
 }
 
-impl<Req, Resp, MkT, MkC> Client<Req, Resp, MkT, MkC>
+impl<Resp, MkT, MkC> Client<Resp, MkT, MkC>
 where
     MkT: MakeTransport,
     MkC: MakeCodec<MkT::ReadHalf, MkT::WriteHalf> + Sync,
-    Resp: EntryMessage + Send + 'static + Sync,
-    Req: EntryMessage + Send + 'static + Sync,
+    Resp: EntryMessage + Send + 'static,
 {
     pub fn new(make_transport: MkT, pool_cfg: Option<Config>, make_codec: MkC) -> Self {
         let make_transport = MakeClientTransport::new(make_transport, make_codec);
@@ -118,9 +114,9 @@ where
     }
 }
 
-impl<Req, Resp, MkT, MkC> Service<ClientContext, ThriftMessage<Req>> for Client<Req, Resp, MkT, MkC>
+impl<Req, Resp, MkT, MkC> Service<ClientContext, ThriftMessage<Req>> for Client<Resp, MkT, MkC>
 where
-    Req: Send + 'static + EntryMessage + Sync,
+    Req: Send + 'static + EntryMessage,
     Resp: EntryMessage + Send + 'static + Sync,
     MkT: MakeTransport,
     MkC: MakeCodec<MkT::ReadHalf, MkT::WriteHalf> + Sync,
