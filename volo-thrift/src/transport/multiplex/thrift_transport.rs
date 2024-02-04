@@ -105,7 +105,7 @@ where
                     }
 
                     while !queue.is_empty() {
-                        let current = queue.pop_front().unwrap();
+                        let current = queue.pop_front().expect("this queue should not be empty");
                         let seq = current.meta.seq_id;
                         resolved.push(seq);
                         let mut cx = ClientContext::new(
@@ -124,7 +124,8 @@ where
                                 inner_write_error.store(true, std::sync::atomic::Ordering::Relaxed);
                                 has_error = true;
                                 while !queue.is_empty() {
-                                    let current = queue.pop_front().unwrap();
+                                    let current =
+                                        queue.pop_front().expect("this queue should not be empty");
                                     resolved.push(current.meta.seq_id);
                                 }
                                 break;
@@ -133,12 +134,19 @@ where
                     }
                     if has_error {
                         for seq in resolved.iter() {
-                            let _ = inner_tx_map.remove(seq).await.unwrap().send(Err(
-                                Error::Application(ApplicationError::new(
-                                    ApplicationErrorKind::UNKNOWN,
-                                    format!("write error "),
-                                )),
-                            ));
+                            match inner_tx_map.remove(seq).await {
+                                Some(chan) => {
+                                    let _ = chan
+                                        .send(Err(Error::Application(ApplicationError::new(
+                                            ApplicationErrorKind::UNKNOWN,
+                                            format!("write error "),
+                                        ))))
+                                        .map_err(|_| {
+                                            tracing::error!("[VOLO] got err when send result");
+                                        });
+                                }
+                                None => {}
+                            };
                         }
                         return;
                     }
@@ -149,12 +157,19 @@ where
                             tracing::error!("[VOLO] multiplex connection flush error: {}", err,);
                             inner_write_error.store(true, std::sync::atomic::Ordering::Relaxed);
                             for seq in resolved.iter() {
-                                let _ = inner_tx_map.remove(&seq).await.unwrap().send(Err(
-                                    Error::Application(ApplicationError::new(
-                                        ApplicationErrorKind::UNKNOWN,
-                                        err.to_string(),
-                                    )),
-                                ));
+                                match inner_tx_map.remove(seq).await {
+                                    Some(chan) => {
+                                        let _ = chan
+                                            .send(Err(Error::Application(ApplicationError::new(
+                                                ApplicationErrorKind::UNKNOWN,
+                                                format!("write error "),
+                                            ))))
+                                            .map_err(|_| {
+                                                tracing::error!("[VOLO] got err when send result");
+                                            });
+                                    }
+                                    None => {}
+                                };
                             }
                             return;
                         }
