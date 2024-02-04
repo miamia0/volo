@@ -43,7 +43,7 @@ where
             .insert(key, value)
     }
 
-    pub async fn for_all_drain(&self, mut f: impl FnMut(T) -> ()) {
+    pub async fn for_all_drain(&self, mut f: impl FnMut(T)) {
         for sharded in self.sharded.iter() {
             let mut s = sharded.lock().await;
             for data in s.drain() {
