@@ -2,10 +2,10 @@ use std::array;
 
 use tokio::sync::Mutex;
 
-const SHARD_COUNT: usize = 64;
+const SHARD_COUNT: i32 = 64;
 
 pub struct TxHashMap<T> {
-    sharded: [Mutex<fxhash::FxHashMap<i32, T>>; SHARD_COUNT],
+    sharded: [Mutex<fxhash::FxHashMap<i32, T>>; SHARD_COUNT as usize],
 }
 
 impl<T> Default for TxHashMap<T> {
@@ -20,11 +20,11 @@ impl<T> TxHashMap<T>
 where
     T: Sized,
 {
+    fn get_shard(&self, key: i32) -> &Mutex<fxhash::FxHashMap<i32, T>> {
+        &self.sharded[((key % SHARD_COUNT + SHARD_COUNT) % SHARD_COUNT) as usize]
+    }
     pub async fn remove(&self, key: &i32) -> Option<T> {
-        self.sharded[(*key % (SHARD_COUNT as i32)) as usize]
-            .lock()
-            .await
-            .remove(key)
+        self.get_shard(*key).lock().await.remove(key)
     }
 
     pub async fn is_empty(&self) -> bool {
@@ -37,10 +37,7 @@ where
     }
 
     pub async fn insert(&self, key: i32, value: T) -> Option<T> {
-        self.sharded[(key % (SHARD_COUNT as i32)) as usize]
-            .lock()
-            .await
-            .insert(key, value)
+        self.get_shard(key).lock().await.insert(key, value)
     }
 
     pub async fn for_all_drain(&self, mut f: impl FnMut(T)) {
@@ -50,5 +47,21 @@ where
                 f(data.1)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::TxHashMap;
+
+    #[tokio::test]
+    async fn test_txmap() {
+        let mp = TxHashMap::default();
+        mp.insert(-1, 1).await;
+        assert_eq!(mp.remove(&-1).await.unwrap(), 1);
+
+        mp.insert(1<<31, 1).await;
+        assert_eq!(mp.remove(&(1<<31)).await.unwrap(), 1);
     }
 }
