@@ -143,7 +143,14 @@ where
         cx.stats.record_make_transport_start_at();
         let transport = self.make_transport.call((target, Ver::Multiplex)).await?;
         cx.stats.record_make_transport_end_at();
-        let resp = transport.send(cx, req, oneway).await;
+        let rx = transport.only_send(cx, req, oneway).await;
+        if oneway {
+            return Ok(None);
+        }
+        if cx.transport.should_reuse {
+            transport.reuse();
+        }
+        let resp = super::thrift_transport::wait(cx, rx?).await;
         if let Ok(None) = resp {
             if !oneway {
                 return Err(Error::Transport(pilota::thrift::TransportError::new(
@@ -151,9 +158,6 @@ where
                     format!("an unexpected end of file from server, cx: {:?}", cx),
                 )));
             }
-        }
-        if cx.transport.should_reuse && resp.is_ok() {
-            transport.reuse();
         }
         resp
     }
