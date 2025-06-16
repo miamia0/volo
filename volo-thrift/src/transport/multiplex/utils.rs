@@ -61,7 +61,7 @@ mod tests {
         mp.insert(-1, 1).await;
         assert_eq!(mp.remove(&-1).await.unwrap(), 1);
 
-        mp.insert(1<<31, 1).await;
-        assert_eq!(mp.remove(&(1<<31)).await.unwrap(), 1);
+        mp.insert(1 << 31, 1).await;
+        assert_eq!(mp.remove(&(1 << 31)).await.unwrap(), 1);
     }
 }

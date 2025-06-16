@@ -1,4 +1,4 @@
-use std::{io, marker::PhantomData};
+use std::{io, marker::PhantomData, sync::Arc};
 
 use motore::service::{Service, UnaryService};
 use pilota::thrift::TransportErrorKind;
@@ -59,18 +59,18 @@ where
     Resp: EntryMessage + Send + 'static + Sync,
     Req: EntryMessage + Send + 'static + Sync,
 {
-    type Response = ThriftTransport<MkC::Encoder, Req, Resp>;
+    type Response = Arc<ThriftTransport<MkC::Encoder, Req, Resp>>;
     type Error = io::Error;
 
     async fn call(&self, target: Address) -> Result<Self::Response, Self::Error> {
         let make_transport = self.make_transport.clone();
         let (rh, wh) = make_transport.make_transport(target.clone()).await?;
-        Ok(ThriftTransport::new(
+        Ok(Arc::new(ThriftTransport::new(
             rh,
             wh,
             self.make_codec.clone(),
             target,
-        ))
+        )))
     }
 }
 
@@ -143,7 +143,8 @@ where
         cx.stats.record_make_transport_start_at();
         let transport = self.make_transport.call((target, Ver::Multiplex)).await?;
         cx.stats.record_make_transport_end_at();
-        let resp = transport.send(cx, req, oneway).await;
+        let rx = transport.only_send(cx, req, oneway).await;
+        let resp = super::thrift_transport::wait(cx, rx?).await;
         if let Ok(None) = resp {
             if !oneway {
                 return Err(Error::Transport(pilota::thrift::TransportError::new(

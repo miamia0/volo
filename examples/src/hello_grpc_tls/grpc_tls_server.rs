@@ -3,7 +3,7 @@
 use std::{net::SocketAddr, path::Path, sync::Arc};
 
 use librustls::{Certificate, PrivateKey, ServerConfig}; /* crate `rustls` is renamed to
-                                                          * `librustls` in this example */
+                                                         * `librustls` in this example */
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use volo_grpc::{
     server::{Server, ServiceBuilder},
