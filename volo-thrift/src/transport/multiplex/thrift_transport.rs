@@ -9,10 +9,12 @@ use std::{
 };
 
 use metainfo::MetaInfo;
-use pin_project::pin_project;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{oneshot, Mutex},
+    sync::{
+        oneshot::{self, Receiver},
+        Mutex,
+    },
 };
 use tokio_condvar::Condvar;
 use volo::{
@@ -35,7 +37,43 @@ lazy_static::lazy_static! {
     static ref TRANSPORT_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 }
 
-#[pin_project]
+struct BufferQueue<Req> {
+    buffer: Mutex<VecDeque<ThriftMessage<Req>>>,
+    queue_cv: Condvar,
+}
+
+impl<Req> BufferQueue<Req> {
+    pub fn new() -> Self {
+        Self {
+            buffer: Mutex::new(VecDeque::new()),
+            queue_cv: Condvar::new(),
+        }
+    }
+
+    pub async fn push(&self, msg: ThriftMessage<Req>) {
+        self.buffer.lock().await.push_back(msg);
+        self.queue_cv.notify_all();
+    }
+
+    pub fn notify_all(&self) {
+        self.queue_cv.notify_all();
+    }
+
+    pub async fn get<F>(&self, buf: &mut Vec<ThriftMessage<Req>>, check_fn: F)
+    where
+        F: Fn() -> bool,
+    {
+        let mut queue = self.buffer.lock().await;
+        while queue.is_empty() && check_fn() {
+            queue = self.queue_cv.wait(queue).await;
+        }
+        while !queue.is_empty() {
+            let current = queue.pop_front().expect("this queue should not be empty");
+            buf.push(current);
+        }
+    }
+}
+
 pub struct ThriftTransport<E, Req, Resp> {
     _phantom1: PhantomData<fn() -> E>,
 
@@ -51,21 +89,14 @@ pub struct ThriftTransport<E, Req, Resp> {
     // read connection is closed
     read_closed: Arc<AtomicBool>,
     // TODO make this to lockless
-    batch_queue: Arc<Mutex<VecDeque<ThriftMessage<Req>>>>,
-    queue_cv: Arc<Condvar>,
+    batch_queue: Arc<BufferQueue<Req>>,
 }
 
-impl<E, Req, Resp> Clone for ThriftTransport<E, Req, Resp> {
-    fn clone(&self) -> Self {
-        Self {
-            tx_map: self.tx_map.clone(),
-            write_error: self.write_error.clone(),
-            read_error: self.read_error.clone(),
-            read_closed: self.read_closed.clone(),
-            batch_queue: self.batch_queue.clone(),
-            _phantom1: PhantomData,
-            queue_cv: self.queue_cv.clone(),
-        }
+impl<E, Req, Resp> ThriftTransport<E, Req, Resp> {
+    pub fn close(&self) {
+        self.read_closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.batch_queue.notify_all();
     }
 }
 
@@ -75,60 +106,57 @@ where
     Req: EntryMessage + Send + 'static + Sync,
     Resp: EntryMessage + Send + 'static + Sync,
 {
-    pub fn write_loop(&self, mut write_half: WriteHalf<E>) {
+    pub fn write_loop(&mut self, mut write_half: WriteHalf<E>) {
         let batch_queu = self.batch_queue.clone();
         let inner_tx_map = self.tx_map.clone();
         let inner_read_error: Arc<AtomicBool> = self.read_error.clone();
         let inner_read_closed = self.read_closed.clone();
         let inner_write_error = self.write_error.clone();
-        let queue_cv = self.queue_cv.clone();
         tokio::spawn(async move {
+            let mut buff = Vec::with_capacity(32);
             let mut resolved = Vec::with_capacity(32);
             let mut has_error;
             loop {
                 {
+                    buff.clear();
                     resolved.clear();
                     write_half.reset().await;
                     has_error = false;
-                    let mut queue = batch_queu.lock().await;
-                    while queue.is_empty()
-                        && !inner_read_error.load(std::sync::atomic::Ordering::Relaxed)
-                        && !inner_read_closed.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        queue = queue_cv.wait(queue).await;
-                    }
+                    batch_queu
+                        .get(&mut buff, || {
+                            !inner_read_error.load(std::sync::atomic::Ordering::Acquire)
+                                && !inner_read_closed.load(std::sync::atomic::Ordering::Acquire)
+                        })
+                        .await;
 
-                    if inner_read_error.load(std::sync::atomic::Ordering::Relaxed)
-                        || inner_read_closed.load(std::sync::atomic::Ordering::Relaxed)
+                    if inner_read_error.load(std::sync::atomic::Ordering::Acquire)
+                        || inner_read_closed.load(std::sync::atomic::Ordering::Acquire)
                     {
                         return;
                     }
 
-                    while !queue.is_empty() {
-                        let current = queue.pop_front().expect("this queue should not be empty");
-                        let seq = current.meta.seq_id;
+                    for b in buff.drain(..) {
+                        let seq = b.meta.seq_id;
                         resolved.push(seq);
-                        let mut cx = ClientContext::new(
-                            seq,
-                            RpcInfo::with_role(Role::Client),
-                            pilota::thrift::TMessageType::Call,
-                        );
-                        let res = write_half.encode(&mut cx, current).await;
-                        match res {
-                            Ok(_) => {}
-                            Err(err) => {
-                                tracing::error!(
-                                    "[VOLO] multiplex connection encode error: {}",
-                                    err
-                                );
-                                inner_write_error.store(true, std::sync::atomic::Ordering::Relaxed);
-                                has_error = true;
-                                while !queue.is_empty() {
-                                    let current =
-                                        queue.pop_front().expect("this queue should not be empty");
-                                    resolved.push(current.meta.seq_id);
+                        if !has_error {
+                            let mut cx = ClientContext::new(
+                                seq,
+                                RpcInfo::with_role(Role::Client),
+                                pilota::thrift::TMessageType::Call,
+                            );
+                            let res = write_half.encode(&mut cx, b).await;
+                            match res {
+                                Ok(_) => {}
+                                Err(err) => {
+                                    tracing::error!(
+                                        "[VOLO] multiplex connection encode error: {}",
+                                        err
+                                    );
+                                    inner_write_error
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    has_error = true;
+                                    break;
                                 }
-                                break;
                             }
                         }
                     }
@@ -294,17 +322,22 @@ where
                 })
                 .await;
         });
-        let ret = Self {
+        let mut ret = Self {
             tx_map,
             write_error,
             read_error,
             read_closed,
-            batch_queue: Default::default(),
+            batch_queue: Arc::new(BufferQueue::new()),
             _phantom1: PhantomData,
-            queue_cv,
         };
         ret.write_loop(write_half);
         ret
+    }
+}
+
+impl<E, Req, Resp> Drop for ThriftTransport<E, Req, Resp> {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -314,12 +347,15 @@ where
     Resp: EntryMessage,
     Req: EntryMessage,
 {
-    pub async fn send(
+    pub async fn only_send(
         &self,
         cx: &mut ClientContext,
         msg: ThriftMessage<Req>,
         oneway: bool,
-    ) -> Result<Option<ThriftMessage<Resp>>, Error> {
+    ) -> Result<
+        Receiver<Result<Option<(MetaInfo, ClientContext, ThriftMessage<Resp>)>, Error>>,
+        Error,
+    > {
         // check error and closed
         if self.read_error.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::Application(ApplicationError::new(
@@ -345,49 +381,63 @@ where
         if !oneway {
             self.tx_map.insert(seq_id, tx).await;
         }
-        {
-            self.batch_queue.lock().await.push_back(msg);
-            self.queue_cv.notify_all();
-        }
+        self.batch_queue.push(msg).await;
+        Ok(rx)
+    }
+
+    pub async fn send(
+        &self,
+        cx: &mut ClientContext,
+        msg: ThriftMessage<Req>,
+        oneway: bool,
+    ) -> Result<Option<ThriftMessage<Resp>>, Error> {
+        let rx = self.only_send(cx, msg, oneway).await?;
         if oneway {
             return Ok(None);
         }
-        match rx.await {
-            Ok(res) => match res {
-                Ok(opt) => match opt {
-                    None => Ok(None),
-                    Some((mi, new_cx, msg)) => {
-                        metainfo::METAINFO.with(|m| {
-                            m.borrow_mut().extend(mi);
-                        });
-                        // TODO: cx extend
-                        if let Some(t) = new_cx.common_stats.decode_start_at() {
-                            cx.common_stats.set_decode_start_at(t);
-                        }
-                        if let Some(t) = new_cx.common_stats.decode_end_at() {
-                            cx.common_stats.set_decode_end_at(t);
-                        }
-                        if let Some(t) = new_cx.common_stats.read_start_at() {
-                            cx.common_stats.set_read_start_at(t);
-                        }
-                        if let Some(t) = new_cx.common_stats.read_end_at() {
-                            cx.common_stats.set_read_end_at(t);
-                        }
-                        if let Some(s) = new_cx.common_stats.read_size() {
-                            cx.common_stats.set_read_size(s);
-                        }
-                        Ok(Some(msg))
+        wait(cx, rx).await
+    }
+}
+
+pub async fn wait<T>(
+    cx: &mut ClientContext,
+    rx: Receiver<Result<Option<(MetaInfo, ClientContext, ThriftMessage<T>)>, Error>>,
+) -> Result<Option<ThriftMessage<T>>, Error> {
+    match rx.await {
+        Ok(res) => match res {
+            Ok(opt) => match opt {
+                None => Ok(None),
+                Some((mi, new_cx, msg)) => {
+                    metainfo::METAINFO.with(|m| {
+                        m.borrow_mut().extend(mi);
+                    });
+                    // TODO: cx extend
+                    if let Some(t) = new_cx.common_stats.decode_start_at() {
+                        cx.common_stats.set_decode_start_at(t);
                     }
-                },
-                Err(e) => Err(e),
+                    if let Some(t) = new_cx.common_stats.decode_end_at() {
+                        cx.common_stats.set_decode_end_at(t);
+                    }
+                    if let Some(t) = new_cx.common_stats.read_start_at() {
+                        cx.common_stats.set_read_start_at(t);
+                    }
+                    if let Some(t) = new_cx.common_stats.read_end_at() {
+                        cx.common_stats.set_read_end_at(t);
+                    }
+                    if let Some(s) = new_cx.common_stats.read_size() {
+                        cx.common_stats.set_read_size(s);
+                    }
+                    Ok(Some(msg))
+                }
             },
-            Err(e) => {
-                tracing::error!("[VOLO] multiplex connection oneshot recv error: {e}");
-                Err(Error::Application(ApplicationError::new(
-                    ApplicationErrorKind::UNKNOWN,
-                    format!("multiplex connection oneshot recv error: {e}"),
-                )))
-            }
+            Err(e) => Err(e),
+        },
+        Err(e) => {
+            tracing::error!("[VOLO] multiplex connection oneshot recv error: {e}");
+            Err(Error::Application(ApplicationError::new(
+                ApplicationErrorKind::UNKNOWN,
+                format!("multiplex connection oneshot recv error: {e}"),
+            )))
         }
     }
 }
@@ -477,7 +527,12 @@ where
     }
 }
 
-impl<TTEncoder, Req, Resp> Poolable for ThriftTransport<TTEncoder, Req, Resp> {
+impl<TTEncoder, Req, Resp> Poolable for Arc<ThriftTransport<TTEncoder, Req, Resp>>
+where
+    TTEncoder: Encoder,
+    Req: EntryMessage + Send + 'static + Sync,
+    Resp: EntryMessage + Send + 'static + Sync,
+{
     fn reusable(&self) -> bool {
         !self.write_error.load(std::sync::atomic::Ordering::Relaxed)
             && !self.read_error.load(std::sync::atomic::Ordering::Relaxed)
